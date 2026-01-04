@@ -87,4 +87,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 GitHub: [@FodiYes](https://github.com/FodiYes)
 
 Enjoy the widget! 🚀
-```

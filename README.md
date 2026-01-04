@@ -1,9 +1,10 @@
 
 # Hardware Monitor Widget
 
-[![GitHub stars](https://img.shields.io/github/stars/FodiYes/HardwareMonitor?style=social)](https://github.com/FodiYes/HardwareMonitor/stargazers)
-[![GitHub license](https://img.shields.io/github/license/FodiYes/HardwareMonitor)](https://github.com/FodiYes/HardwareMonitor/blob/master/LICENSE)
-[![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
+![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square&logo=windows)
+![Language](https://img.shields.io/badge/language-C%2B%2B-00599C?style=flat-square&logo=c%2B%2B)
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+![ImGui](https://img.shields.io/badge/framework-ImGui-00599C?style=flat-square&logo=c%2B%2B&logoColor=white)
 
 ## Features
 

@@ -163,7 +163,7 @@ public:
             colStart.x + (colEnd.x - colStart.x) * t,
             colStart.y + (colEnd.y - colStart.y) * t,
             colStart.z + (colEnd.z - colStart.z) * t,
-            1.0f * GlobalOpacity 
+            1.0f * GlobalOpacity
         );
 
         ImVec2 knobPos = ImVec2(center.x + cosf(currentAngle) * radius, center.y + sinf(currentAngle) * radius);

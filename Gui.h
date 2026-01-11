@@ -68,7 +68,7 @@ public:
         Theme::DrawGradientMetric("GPU", gpuBuf, hw.gpu_load, Theme::Col_GPU_Start, Theme::Col_GPU_End, radius);
 
         ImGui::SetCursorPos(ImVec2(spacing * 2.5f - radius, contentY));
-        char ramBuf[32]; sprintf(ramBuf, "%.1f", hw.ram_usage);
+        char ramBuf[32]; sprintf(ramBuf, "%.1f", hw.ram_usage_gb);
         Theme::DrawGradientMetric("RAM", ramBuf, hw.ram_percent, Theme::Col_RAM_Start, Theme::Col_RAM_End, radius);
 
         if (!isPinned) {

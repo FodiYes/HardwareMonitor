@@ -18,22 +18,23 @@
 
 #pragma comment(lib, "pdh.lib")
 
-ULONGLONG FT2ULL(FILETIME ft) {
-    ULARGE_INTEGER li;
-    li.LowPart = ft.dwLowDateTime;
-    li.HighPart = ft.dwHighDateTime;
-    return li.QuadPart;
-}
-
+#ifndef PDH_CSTATUS_VALID
+#define PDH_CSTATUS_VALID ((DWORD)0x00000000L)
+#endif
+#ifndef PDH_CSTATUS_NEW_DATA
+#define PDH_CSTATUS_NEW_DATA ((DWORD)0x00000001L)
+#endif
 
 typedef struct nvmlDevice_st* nvmlDevice_t;
 typedef struct nvmlUtilization_st { unsigned int gpu; unsigned int memory; } nvmlUtilization_t;
+typedef struct nvmlMemory_st { unsigned long long total; unsigned long long free; unsigned long long used; } nvmlMemory_t;
+
 typedef int(*nvmlInit_t)();
 typedef int(*nvmlShutdown_t)();
 typedef int(*nvmlDeviceGetHandleByIndex_t)(unsigned int, nvmlDevice_t*);
 typedef int(*nvmlDeviceGetUtilizationRates_t)(nvmlDevice_t, nvmlUtilization_st*);
 typedef int(*nvmlDeviceGetTemperature_t)(nvmlDevice_t, int, unsigned int*);
-
+typedef int(*nvmlDeviceGetMemoryInfo_t)(nvmlDevice_t, nvmlMemory_t*);
 
 typedef void* (*ADL_MAIN_MALLOC_CALLBACK)(int);
 typedef struct AdapterInfo {
@@ -41,24 +42,37 @@ typedef struct AdapterInfo {
     char strAdapterName[256]; char strDisplayName[256]; int iPresent; int iExist; char strDriverPath[256]; char strDriverPathExt[256];
     char strPNPString[256]; int iOSDisplayIndex;
 } AdapterInfo;
+
 typedef struct ADLPMActivity {
     int iSize; int iEngineClock; int iMemoryClock; int iVddc; int iActivityPercent;
     int iCurrentPerformanceLevel; int iCurrentBusSpeed; int iCurrentBusLanes; int iMaximumBusLanes; int iReserved;
 } ADLPMActivity;
+
+typedef struct ADLMemoryInfo {
+    long long iMemorySize; char strMemoryType[256]; long long iMemoryBandwidth;
+} ADLMemoryInfo;
 
 typedef int(*ADL_Main_Control_Create_t)(ADL_MAIN_MALLOC_CALLBACK, int);
 typedef int(*ADL_Main_Control_Destroy_t)();
 typedef int(*ADL_Adapter_NumberOfAdapters_Get_t)(int*);
 typedef int(*ADL_Adapter_AdapterInfo_Get_t)(AdapterInfo*, int);
 typedef int(*ADL_Overdrive5_CurrentActivity_Get_t)(int, ADLPMActivity*);
+typedef int(*ADL_Adapter_MemoryInfo_Get_t)(int, ADLMemoryInfo*);
 
 void* __stdcall ADL_Main_Memory_Alloc(int iSize) { return malloc(iSize); }
 
+
+inline ULONGLONG FT2ULL(FILETIME ft) {
+    ULARGE_INTEGER li;
+    li.LowPart = ft.dwLowDateTime;
+    li.HighPart = ft.dwHighDateTime;
+    return li.QuadPart;
+}
+
 class Hardware {
 private:
-    ULONGLONG lastIdle = 0;
-    ULONGLONG lastKernel = 0;
-    ULONGLONG lastUser = 0;
+    PDH_HQUERY cpuQuery = NULL;
+    PDH_HCOUNTER cpuCounter = NULL;
 
     static const int CPU_BUFFER_SIZE = 10;
     std::vector<float> cpuBuffer;
@@ -70,26 +84,35 @@ private:
     PDH_HQUERY gpuQuery = NULL;
     PDH_HCOUNTER gpuCounter = NULL;
     bool pdhGpuInit = false;
+    std::vector<BYTE> pdhRawBuffer; 
 
     HMODULE hNvml = nullptr;
     nvmlDevice_t nvidiaDevice = nullptr;
     nvmlDeviceGetUtilizationRates_t nvmlGetUsage = nullptr;
     nvmlDeviceGetTemperature_t nvmlGetTemp = nullptr;
+    nvmlDeviceGetMemoryInfo_t nvmlGetMem = nullptr;
 
     HMODULE hAdl = nullptr;
     int amdAdapterIndex = -1;
     ADL_Overdrive5_CurrentActivity_Get_t adlGetActivity = nullptr;
+    ADL_Adapter_MemoryInfo_Get_t adlGetMemInfo = nullptr;
+    long long amdTotalVram = 0;
 
     float target_cpu = 0.0f;
     float target_gpu = 0.0f;
-    float target_ram = 0.0f;
+    float target_ram_load = 0.0f;
 
 public:
     float cpu_load = 0.0f;
+
     float gpu_load = 0.0f;
     float gpu_temp = 0.0f;
-    float ram_usage = 0.0f; 
-    float ram_percent = 0.0f; 
+    float gpu_vram_used = 0.0f;
+    float gpu_vram_total = 0.0f;
+
+    float ram_usage_gb = 0.0f;
+    float ram_percent = 0.0f;
+    float ram_total_gb = 0.0f;
 
     Hardware() {
         cpuBuffer.resize(CPU_BUFFER_SIZE, 0.0f);
@@ -98,11 +121,24 @@ public:
         if (InitNvidia()) gpuSource = SOURCE_NVIDIA;
         else if (InitAMD()) gpuSource = SOURCE_AMD;
         else if (InitUniversalGPU()) gpuSource = SOURCE_PDH;
+
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        if (GlobalMemoryStatusEx(&memInfo)) {
+            ram_total_gb = (float)memInfo.ullTotalPhys / (1024.f * 1024.f * 1024.f);
+        }
     }
 
     ~Hardware() {
+        if (cpuQuery) PdhCloseQuery(cpuQuery);
         if (pdhGpuInit) PdhCloseQuery(gpuQuery);
-        if (hNvml) FreeLibrary(hNvml);
+
+        if (hNvml) {
+            auto nvmlShutdown = (nvmlShutdown_t)GetProcAddress(hNvml, "nvmlShutdown");
+            if (nvmlShutdown) nvmlShutdown();
+            FreeLibrary(hNvml);
+        }
+
         if (hAdl) {
             auto adlDestroy = (ADL_Main_Control_Destroy_t)GetProcAddress(hAdl, "ADL_Main_Control_Destroy");
             if (adlDestroy) adlDestroy();
@@ -111,49 +147,56 @@ public:
     }
 
     float Lerp(float a, float b, float t) {
+        if (std::abs(b - a) < 0.01f) return b;
         return a + (b - a) * t;
     }
 
     void InitCPU() {
-        FILETIME fIdle, fKernel, fUser;
-        GetSystemTimes(&fIdle, &fKernel, &fUser);
-        lastIdle = FT2ULL(fIdle);
-        lastKernel = FT2ULL(fKernel);
-        lastUser = FT2ULL(fUser);
+        cpuQuery = NULL;
+        cpuCounter = NULL;
+
+        FILETIME idle, kernel, user;
+        GetSystemTimes(&idle, &kernel, &user);
     }
 
+
     void MeasureCPU() {
-        FILETIME fIdle, fKernel, fUser;
-        GetSystemTimes(&fIdle, &fKernel, &fUser);
+        static ULONGLONG lastIdle = 0;
+        static ULONGLONG lastKernel = 0;
+        static ULONGLONG lastUser = 0;
+        static bool inited = false;
 
-        ULONGLONG nowIdle = FT2ULL(fIdle);
-        ULONGLONG nowKernel = FT2ULL(fKernel);
-        ULONGLONG nowUser = FT2ULL(fUser);
+        FILETIME idleFT, kernelFT, userFT;
+        if (!GetSystemTimes(&idleFT, &kernelFT, &userFT)) return;
 
-        ULONGLONG deltaIdle = nowIdle - lastIdle;
-        ULONGLONG deltaKernel = nowKernel - lastKernel;
-        ULONGLONG deltaUser = nowUser - lastUser;
+        ULONGLONG idle = FT2ULL(idleFT);
+        ULONGLONG kernel = FT2ULL(kernelFT);
+        ULONGLONG user = FT2ULL(userFT);
 
-        // Formula: Total = Kernel + User. (Kernel includes Idle time already)
-        ULONGLONG totalSystem = deltaKernel + deltaUser;
-
-        float rawPercent = 0.0f;
-        if (totalSystem > 0) {
-            ULONGLONG used = totalSystem - deltaIdle;
-            rawPercent = (float)used * 100.0f / (float)totalSystem;
+        if (!inited) {
+            lastIdle = idle;
+            lastKernel = kernel;
+            lastUser = user;
+            inited = true;
+            target_cpu = 0.0f;
+            return;
         }
 
-        rawPercent = std::max(0.0f, std::min(100.0f, rawPercent));
+        ULONGLONG idleDiff = idle - lastIdle;
+        ULONGLONG totalDiff = (kernel - lastKernel) + (user - lastUser);
 
-        cpuBuffer[bufferIndex] = rawPercent;
-        bufferIndex = (bufferIndex + 1) % CPU_BUFFER_SIZE;
+        lastIdle = idle;
+        lastKernel = kernel;
+        lastUser = user;
 
-        float sum = std::accumulate(cpuBuffer.begin(), cpuBuffer.end(), 0.0f);
-        target_cpu = sum / CPU_BUFFER_SIZE;
+        if (totalDiff == 0) return;
 
-        lastIdle = nowIdle;
-        lastKernel = nowKernel;
-        lastUser = nowUser;
+        double cpu = (1.0 - (double)idleDiff / (double)totalDiff) * 100.0;
+
+        if (cpu < 0.0) cpu = 0.0;
+        if (cpu > 100.0) cpu = 100.0;
+
+        target_cpu = (float)cpu;
     }
 
     bool InitNvidia() {
@@ -164,12 +207,23 @@ public:
         auto nvmlInit = (nvmlInit_t)GetProcAddress(hNvml, "nvmlInit_v2");
         if (!nvmlInit) nvmlInit = (nvmlInit_t)GetProcAddress(hNvml, "nvmlInit");
         auto nvmlGetHandle = (nvmlDeviceGetHandleByIndex_t)GetProcAddress(hNvml, "nvmlDeviceGetHandleByIndex_v2");
+
         nvmlGetUsage = (nvmlDeviceGetUtilizationRates_t)GetProcAddress(hNvml, "nvmlDeviceGetUtilizationRates");
         nvmlGetTemp = (nvmlDeviceGetTemperature_t)GetProcAddress(hNvml, "nvmlDeviceGetTemperature");
+        nvmlGetMem = (nvmlDeviceGetMemoryInfo_t)GetProcAddress(hNvml, "nvmlDeviceGetMemoryInfo");
 
         if (nvmlInit && nvmlGetHandle && nvmlGetUsage && nvmlInit() == 0) {
-            return (nvmlGetHandle(0, &nvidiaDevice) == 0);
+            if (nvmlGetHandle(0, &nvidiaDevice) == 0) {
+                if (nvmlGetMem) {
+                    nvmlMemory_t mem = { 0 };
+                    if (nvmlGetMem(nvidiaDevice, &mem) == 0) {
+                        gpu_vram_total = (float)mem.total / (1024.f * 1024.f * 1024.f);
+                    }
+                }
+                return true;
+            }
         }
+        FreeLibrary(hNvml); hNvml = nullptr;
         return false;
     }
 
@@ -182,6 +236,7 @@ public:
         auto adlNumAdapters = (ADL_Adapter_NumberOfAdapters_Get_t)GetProcAddress(hAdl, "ADL_Adapter_NumberOfAdapters_Get");
         auto adlGetInfo = (ADL_Adapter_AdapterInfo_Get_t)GetProcAddress(hAdl, "ADL_Adapter_AdapterInfo_Get");
         adlGetActivity = (ADL_Overdrive5_CurrentActivity_Get_t)GetProcAddress(hAdl, "ADL_Overdrive5_CurrentActivity_Get");
+        adlGetMemInfo = (ADL_Adapter_MemoryInfo_Get_t)GetProcAddress(hAdl, "ADL_Adapter_MemoryInfo_Get");
 
         if (adlCreate && adlCreate(ADL_Main_Memory_Alloc, 1) == 0) {
             int numAdapters = 0;
@@ -191,21 +246,32 @@ public:
                 if (adlGetInfo(infos.data(), sizeof(AdapterInfo) * numAdapters) == 0) {
                     for (int i = 0; i < numAdapters; i++) {
                         ADLPMActivity act = { 0 }; act.iSize = sizeof(ADLPMActivity);
-                        if (infos[i].iPresent && adlGetActivity(infos[i].iAdapterIndex, &act) == 0) {
+                        if (infos[i].iPresent && adlGetActivity && adlGetActivity(infos[i].iAdapterIndex, &act) == 0) {
                             amdAdapterIndex = infos[i].iAdapterIndex;
+
+                            if (adlGetMemInfo) {
+                                ADLMemoryInfo memVal = { 0 };
+                                if (adlGetMemInfo(infos[i].iAdapterIndex, &memVal) == 0) {
+                                    gpu_vram_total = (float)memVal.iMemorySize / (1024.f * 1024.f * 1024.f);
+                                }
+                            }
                             return true;
                         }
                     }
                 }
             }
         }
+        FreeLibrary(hAdl); hAdl = nullptr;
         return false;
     }
 
     bool InitUniversalGPU() {
         if (PdhOpenQuery(NULL, 0, &gpuQuery) == ERROR_SUCCESS) {
             if (PdhAddEnglishCounter(gpuQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &gpuCounter) != ERROR_SUCCESS) {
-                PdhAddCounter(gpuQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &gpuCounter);
+                if (PdhAddCounter(gpuQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &gpuCounter) != ERROR_SUCCESS) {
+                    PdhCloseQuery(gpuQuery);
+                    return false;
+                }
             }
             PdhCollectQueryData(gpuQuery);
             pdhGpuInit = true;
@@ -214,53 +280,81 @@ public:
         return false;
     }
 
+    void MeasureGPU() {
+        float rawGpu = 0.0f;
+        float rawVramUsed = 0.0f;
+
+        if (gpuSource == SOURCE_NVIDIA) {
+            if (nvmlGetUsage) {
+                nvmlUtilization_st rates;
+                if (nvmlGetUsage(nvidiaDevice, &rates) == 0) rawGpu = (float)rates.gpu;
+            }
+            if (nvmlGetTemp) {
+                unsigned int temp = 0;
+                if (nvmlGetTemp(nvidiaDevice, 0, &temp) == 0) gpu_temp = (float)temp;
+            }
+            if (nvmlGetMem) {
+                nvmlMemory_t mem = { 0 };
+                if (nvmlGetMem(nvidiaDevice, &mem) == 0) {
+                    rawVramUsed = (float)mem.used / (1024.f * 1024.f * 1024.f);
+                }
+            }
+        }
+        else if (gpuSource == SOURCE_AMD) {
+            if (adlGetActivity) {
+                ADLPMActivity act = { 0 }; act.iSize = sizeof(ADLPMActivity);
+                if (adlGetActivity(amdAdapterIndex, &act) == 0) rawGpu = (float)act.iActivityPercent;
+            }
+        }
+        else if (gpuSource == SOURCE_PDH && pdhGpuInit) {
+            PdhCollectQueryData(gpuQuery);
+
+            DWORD dwBufferSize = 0, dwItemCount = 0;
+            PdhGetFormattedCounterArray(gpuCounter, PDH_FMT_DOUBLE, &dwBufferSize, &dwItemCount, NULL);
+
+            if (dwBufferSize > 0) {
+                if (pdhRawBuffer.size() < dwBufferSize) pdhRawBuffer.resize(dwBufferSize);
+
+                PDH_FMT_COUNTERVALUE_ITEM* pItems = (PDH_FMT_COUNTERVALUE_ITEM*)pdhRawBuffer.data();
+
+                PDH_STATUS status = PdhGetFormattedCounterArray(gpuCounter, PDH_FMT_DOUBLE, &dwBufferSize, &dwItemCount, pItems);
+
+                if (status == ERROR_SUCCESS) {
+                    double maxLoad = 0.0;
+                    for (DWORD i = 0; i < dwItemCount; i++) {
+                        if (pItems[i].FmtValue.CStatus == PDH_CSTATUS_VALID) {
+                            if (pItems[i].FmtValue.doubleValue > maxLoad) maxLoad = pItems[i].FmtValue.doubleValue;
+                        }
+                    }
+                    rawGpu = (float)maxLoad;
+                }
+            }
+        }
+        target_gpu = std::max(0.0f, std::min(100.0f, rawGpu));
+        gpu_vram_used = rawVramUsed;
+    }
+
     void Update(float deltaTime) {
         static float sensorTimer = 0.0f;
         sensorTimer += deltaTime;
 
-        if (sensorTimer >= 0.1f) {
+        if (sensorTimer >= 0.2f) {
             sensorTimer = 0.0f;
 
             MeasureCPU();
-
-            float rawGpu = 0.0f;
-            if (gpuSource == SOURCE_NVIDIA) {
-                nvmlUtilization_st rates;
-                if (nvmlGetUsage(nvidiaDevice, &rates) == 0) rawGpu = (float)rates.gpu;
-                unsigned int temp = 0;
-                if (nvmlGetTemp && nvmlGetTemp(nvidiaDevice, 0, &temp) == 0) gpu_temp = (float)temp;
-            }
-            else if (gpuSource == SOURCE_AMD) {
-                ADLPMActivity act = { 0 }; act.iSize = sizeof(ADLPMActivity);
-                if (adlGetActivity(amdAdapterIndex, &act) == 0) rawGpu = (float)act.iActivityPercent;
-            }
-            else if (gpuSource == SOURCE_PDH && pdhGpuInit) {
-                PdhCollectQueryData(gpuQuery);
-                PDH_FMT_COUNTERVALUE_ITEM* pItems = NULL;
-                DWORD dwBufferSize = 0, dwItemCount = 0;
-                PdhGetFormattedCounterArray(gpuCounter, PDH_FMT_DOUBLE, &dwBufferSize, &dwItemCount, NULL);
-                if (dwBufferSize > 0) {
-                    pItems = (PDH_FMT_COUNTERVALUE_ITEM*)malloc(dwBufferSize);
-                    if (pItems) {
-                        PdhGetFormattedCounterArray(gpuCounter, PDH_FMT_DOUBLE, &dwBufferSize, &dwItemCount, pItems);
-                        double maxLoad = 0.0;
-                        for (DWORD i = 0; i < dwItemCount; i++) if (pItems[i].FmtValue.doubleValue > maxLoad) maxLoad = pItems[i].FmtValue.doubleValue;
-                        rawGpu = (float)maxLoad;
-                        free(pItems);
-                    }
-                }
-            }
-            target_gpu = std::max(0.0f, std::min(100.0f, rawGpu));
+            MeasureGPU();
 
             MEMORYSTATUSEX memInfo;
             memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-            GlobalMemoryStatusEx(&memInfo);
-            ram_usage = (memInfo.ullTotalPhys - memInfo.ullAvailPhys) / (1024.f * 1024.f * 1024.f);
-            target_ram = (float)memInfo.dwMemoryLoad;
+            if (GlobalMemoryStatusEx(&memInfo)) {
+                ram_usage_gb = (float)(memInfo.ullTotalPhys - memInfo.ullAvailPhys) / (1024.f * 1024.f * 1024.f);
+                target_ram_load = (float)memInfo.dwMemoryLoad;
+            }
         }
 
-        cpu_load = Lerp(cpu_load, target_cpu, deltaTime * 5.0f);
-        gpu_load = Lerp(gpu_load, target_gpu, deltaTime * 5.0f);
-        ram_percent = Lerp(ram_percent, target_ram, deltaTime * 5.0f);
+        float smoothSpeed = deltaTime * 5.0f;
+        cpu_load = Lerp(cpu_load, target_cpu, smoothSpeed);
+        gpu_load = Lerp(gpu_load, target_gpu, smoothSpeed);
+        ram_percent = Lerp(ram_percent, target_ram_load, smoothSpeed);
     }
 };

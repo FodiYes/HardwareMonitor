@@ -18,13 +18,6 @@
 - Lightweight and efficient — built with Dear ImGui + DirectX 11
 - No background window chrome — fully transparent and borderless
 
-## Screenshots
-
-> (Add actual screenshots here once available)
-
-- Normal mode (top-most with controls)  
-- Pinned mode (click-through, controls hidden in tray)
-
 ## Requirements
 
 - Windows 10 or Windows 11
